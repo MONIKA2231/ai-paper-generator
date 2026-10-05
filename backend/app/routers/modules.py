@@ -1502,18 +1502,73 @@ def generate_paper(
 
     if data.generation_mode == "question_bank":
         content = []
-        for i, question in enumerate(questions[:data.total_questions], 1):
-            content.append({
-                "number": i,
-                "section": "Section A" if question.marks <= 2 else "Section B",
-                "question": question.question_text,
-                "marks": question.marks,
-                "unit": question.unit,
-                "topic": question.topic,
-                "difficulty": question.difficulty,
-                "bloom_level": question.bloom_level,
-                "co": question.course_outcome,
-            })
+        q_idx = 0
+        num = 1
+        
+        for _ in range(data.section_a_questions or 0):
+            if q_idx < len(questions):
+                q = questions[q_idx]
+                q_idx += 1
+                content.append({
+                    "number": num,
+                    "section": "Section A",
+                    "question": q.question_text,
+                    "marks": data.section_a_marks,
+                    "unit": q.unit,
+                    "topic": q.topic,
+                    "difficulty": q.difficulty,
+                    "bloom_level": q.bloom_level,
+                    "co": q.course_outcome,
+                })
+                num += 1
+                
+        for _ in range(data.section_b_questions or 0):
+            if data.choice_mode and "internal" in data.choice_mode.lower():
+                if q_idx + 1 < len(questions):
+                    qa = questions[q_idx]
+                    qb = questions[q_idx + 1]
+                    q_idx += 2
+                    content.append({
+                        "number": num,
+                        "section": "Section B",
+                        "choices": [
+                            {
+                                "question": qa.question_text,
+                                "marks": data.section_b_marks,
+                                "unit": qa.unit,
+                                "topic": qa.topic,
+                                "difficulty": qa.difficulty,
+                                "bloom_level": qa.bloom_level,
+                                "co": qa.course_outcome,
+                            },
+                            {
+                                "question": qb.question_text,
+                                "marks": data.section_b_marks,
+                                "unit": qb.unit,
+                                "topic": qb.topic,
+                                "difficulty": qb.difficulty,
+                                "bloom_level": qb.bloom_level,
+                                "co": qb.course_outcome,
+                            }
+                        ]
+                    })
+                    num += 1
+            else:
+                if q_idx < len(questions):
+                    q = questions[q_idx]
+                    q_idx += 1
+                    content.append({
+                        "number": num,
+                        "section": "Section B",
+                        "question": q.question_text,
+                        "marks": data.section_b_marks,
+                        "unit": q.unit,
+                        "topic": q.topic,
+                        "difficulty": q.difficulty,
+                        "bloom_level": q.bloom_level,
+                        "co": q.course_outcome,
+                    })
+                    num += 1
     else:
         instructions = data.instructions or f"Section A: {data.section_a_questions} questions of {data.section_a_marks} marks each. Section B: {data.section_b_questions} questions of {data.section_b_marks} marks each."
         
