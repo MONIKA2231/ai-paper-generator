@@ -1,0 +1,16 @@
+# Environment variables and secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+frontend/dist/
+
+# SQLite database
+*.db
+*.sqlite
+*.sqlite3
