@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useRef } from 'react';
-import { generateLocalAcademicAnswer, generateLocalAssistantResponse, generateLocalPaper } from './academicEngine';
+import { generateLocalAcademicAnswer, generateLocalAssistantResponse } from './academicEngine';
 import {
   LayoutDashboard,
   BookOpen,
@@ -1333,7 +1333,7 @@ function QuestionBank() {
         { method: 'POST', body: fd }
       );
       setMsg(
-        `${d.message}. Section A (2 marks): ${d.section_a_questions}. Section B (8 marks): ${d.section_b_questions}. Ignored non-question lines: ${d.ignored}.`
+        `${d.message} (Duplicates: ${d.duplicates}, Mapped: ${d.mapped}, Needs Review: ${d.needs_review})`
       );
       await load(d.subject_name || name);
     } catch (e) {
@@ -1821,7 +1821,6 @@ function BlueprintDesigner() {
 
 function PaperGenerator() {
   const [subjects, setSubjects] = useState([]);
-  const [blueprints, setBlueprints] = useState([]);
   const [f, setF] = usePersistedState('aiqpg_paper_form', {
     subject_id: '',
     syllabus_id: '',
@@ -1851,29 +1850,24 @@ function PaperGenerator() {
     api('/subjects')
       .then((d) => setSubjects(safeArray(d)))
       .catch(() => {});
-    api('/blueprints')
-      .then((d) => setBlueprints(safeArray(d)))
-      .catch(() => {});
   }, []);
-
-  useEffect(() => {
-    if (safeForm.subject_id && blueprints.length > 0) {
-      const subjectIdNum = Number(safeForm.subject_id);
-      const available = safeArray(blueprints).filter((b) => b.subject_id === subjectIdNum);
-      const currentValid = available.find(b => b.id === Number(safeForm.blueprint_id));
-      if (!currentValid && available.length > 0) {
-        setF(prev => ({ ...prev, blueprint_id: available[0].id }));
-      }
-    }
-  }, [safeForm.subject_id, blueprints]);
 
   const aCount = Number(safeForm.section_a_questions) || 0;
   const aMarks = Number(safeForm.section_a_marks) || 0;
   const bCount = Number(safeForm.section_b_questions) || 0;
   const bMarks = Number(safeForm.section_b_marks) || 0;
-  const totalQuestions = aCount + bCount;
-  const totalMarks = aCount * aMarks + bCount * bMarks;
-  const internalChoice = safeForm.choice_mode === 'Internal Choice' || safeForm.choice_mode === 'Either/Or';
+  
+  const choiceMode = safeForm.choice_mode || 'No Choice';
+  const internalChoice = choiceMode === 'Internal Choice' || choiceMode === 'Either/Or';
+  
+  // Either/Or implies attempting both parts
+  const isEitherOr = choiceMode === 'Either/Or';
+  const effectiveBQuestions = isEitherOr ? bCount * 2 : bCount;
+
+  const totalQuestions = aCount + effectiveBQuestions;
+  const totalMarks = aCount * aMarks + effectiveBQuestions * bMarks;
+
+  const [generating, setGenerating] = useState(false);
 
   const gen = async () => {
     try {
@@ -1882,13 +1876,21 @@ function PaperGenerator() {
         throw Error('Enter valid section counts and marks.');
       if (internalChoice && bCount === 0)
         throw Error('Enter at least one Section B question slot for internal choice.');
+
+      setGenerating(true);
+      setMsg(
+        safeForm.generation_mode === 'question_bank'
+          ? 'Selecting questions by their marks from the question bank...'
+          : 'Generating a paper from the question bank using a configured AI provider... Please wait.'
+      );
+
       const d = await api('/papers/generate', {
         method: 'POST',
         body: JSON.stringify({
-          ...safeForm,
           subject_id: Number(safeForm.subject_id),
-          blueprint_id: safeForm.blueprint_id ? Number(safeForm.blueprint_id) : null,
-          syllabus_id: safeForm.syllabus_id ? Number(safeForm.syllabus_id) : null,
+          title: safeForm.title,
+          exam_type: safeForm.exam_type,
+          duration: safeForm.duration,
           total_marks: totalMarks,
           total_questions: totalQuestions,
           section_a_questions: aCount,
@@ -1897,10 +1899,6 @@ function PaperGenerator() {
           section_b_marks: bMarks,
           choice_mode: safeForm.choice_mode,
           generation_mode: safeForm.generation_mode,
-          topics: String(safeForm.topics || '')
-            .split(',')
-            .map((x) => x.trim())
-            .filter(Boolean),
         }),
       });
       setPaper(d);
@@ -1908,20 +1906,9 @@ function PaperGenerator() {
       setEditing(false);
       setMsg(d.message);
     } catch (e) {
-      if (e.isNetworkError || (e.message && e.message.includes('offline resilience mode'))) {
-        const fallback = generateLocalPaper({
-          section_a_questions: aCount,
-          section_a_marks: aMarks,
-          section_b_questions: bCount,
-          section_b_marks: bMarks,
-        });
-        setPaper(fallback);
-        setEditContent(JSON.parse(JSON.stringify(fallback.content || [])));
-        setEditing(false);
-        setMsg(fallback.message);
-      } else {
-        setMsg(e.message);
-      }
+      setMsg(e.message);
+    } finally {
+      setGenerating(false);
     }
   };
 
@@ -2002,9 +1989,10 @@ function PaperGenerator() {
     b.forEach((q) => {
       html += `<div class="q"><b>${q.number}.</b>`;
       if (q.choices?.length === 2) {
+        const choiceLabel = paper.choice_mode === 'Either/Or' ? 'AND' : 'OR';
         html += `<div class="choice"><b>(a)</b> ${escapeHtml(q.choices[0].question)} <span class="marks">${
           q.choices[0].marks
-        } marks</span></div><div class="or">OR</div><div class="choice"><b>(b)</b> ${escapeHtml(
+        } marks</span></div><div class="or">${choiceLabel}</div><div class="choice"><b>(b)</b> ${escapeHtml(
           q.choices[1].question
         )} <span class="marks">${q.choices[1].marks} marks</span></div>`;
       } else {
@@ -2070,7 +2058,7 @@ function PaperGenerator() {
   return (
     <Module
       title="AI Paper Generator"
-      subtitle="Create the exact paper structure and optionally use internal a OR b choice in Section B."
+      subtitle="Generate questions only from the approved question bank. The AI uses each question's marks as its weightage."
     >
       <div className="form-grid">
         <Field label="Subject">
@@ -2084,21 +2072,6 @@ function PaperGenerator() {
                 {s.code} - {s.name}
               </option>
             ))}
-          </select>
-        </Field>
-        <Field label="Blueprint">
-          <select
-            value={safeForm.blueprint_id ?? ''}
-            onChange={(e) => setF({ ...safeForm, blueprint_id: e.target.value })}
-          >
-            <option value="">No Blueprint / Manual Sections</option>
-            {safeArray(blueprints)
-              .filter((b) => !safeForm.subject_id || b.subject_id === Number(safeForm.subject_id))
-              .map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.blueprint_name}
-                </option>
-              ))}
           </select>
         </Field>
         <Field label="Paper Title">
@@ -2126,7 +2099,7 @@ function PaperGenerator() {
           >
             <option value="hybrid">Question Bank + AI for Missing Questions</option>
             <option value="question_bank">Question Bank Only</option>
-            <option value="ai">AI Generated</option>
+            <option value="ai">AI Generated from Question Bank</option>
           </select>
         </Field>
       </div>
@@ -2183,19 +2156,6 @@ function PaperGenerator() {
             <option>Either/Or</option>
           </select>
         </Field>
-        <Field label="Topics (optional)">
-          <input
-            value={safeForm.topics ?? ''}
-            onChange={(e) => setF({ ...safeForm, topics: e.target.value })}
-            placeholder="MQTT, sensors, IoT architecture"
-          />
-        </Field>
-        <Field label="Instructions">
-          <textarea
-            value={safeForm.instructions ?? ''}
-            onChange={(e) => setF({ ...safeForm, instructions: e.target.value })}
-          />
-        </Field>
       </div>
       {internalChoice && (
         <div className="notice">
@@ -2203,8 +2163,8 @@ function PaperGenerator() {
           marks. The pair counts as ONE question slot.
         </div>
       )}
-      <button className="primary" disabled={!safeForm.subject_id || totalQuestions === 0} onClick={gen}>
-        <Sparkles size={16} /> Generate Exact Question Paper
+      <button className="primary" disabled={!safeForm.subject_id || totalQuestions === 0 || generating} onClick={gen}>
+        <Sparkles size={16} /> {generating ? 'Generating... (Please wait)' : 'Generate Exact Question Paper'}
       </button>
       {msg && <div className="notice">{msg}</div>}
       {paper && (
@@ -2307,7 +2267,9 @@ function PaperGenerator() {
                           </small>
                         )}
                       </div>
-                      <div style={{ textAlign: 'center', fontWeight: 700, margin: '8px 0' }}>OR</div>
+                      <div style={{ textAlign: 'center', fontWeight: 700, margin: '8px 0' }}>
+                        {paper.choice_mode === 'Either/Or' ? 'AND' : 'OR'}
+                      </div>
                       <div>
                         <b>(b)</b>
                         {editing ? (
@@ -4213,9 +4175,6 @@ export default function App() {
     </div>
   );
 }
-
-
-
 
 
 

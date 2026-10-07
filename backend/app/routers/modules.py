@@ -1,6 +1,7 @@
 import json
 import re
 import io
+import random
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -919,61 +920,86 @@ async def upload_questions(
     mapped_count = 0
     review_count = 0
 
-    if filename.endswith((".pdf", ".docx", ".txt")):
-        # Remove section headers entirely from the text
-        text = re.sub(r"(?im)^\s*(?:section|part|module|unit)\s*[-_:]?\s*[a-z0-9\s,]+(?:\s*\(.*?\))?\s*$", "", text)
-        
-        # Split by question numbers at the start of a line
-        blocks = re.split(r"(?im)^\s*(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]\s+", text)
-        
-        # If it found question numbers, use blocks (ignoring the first chunk which is usually intro text)
-        if len(blocks) > 2:
-            lines = []
-            for b in blocks[1:]:
-                # Flatten the block into a single line, replacing newlines with spaces
-                b_flat = re.sub(r"\s+", " ", b).strip()
-                if b_flat:
-                    lines.append(b_flat)
-        else:
-            # Fallback to line-by-line if no clear numbering exists
-            lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 8]
-    else:
-        # For CSV/XLSX, each row is a line
-        lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 8]
+    extracted_questions = []
 
-    for line in lines:
-        # Remove common numbering such as 1., Q1., Question 1), etc. in case it wasn't stripped
-        line = re.sub(
-            r"^\s*(?:Q(?:uestion)?\s*)?\d+[\.\):\-]\s*",
-            "",
-            line,
-            flags=re.I,
-        ).strip()
+    if filename.endswith(('.pdf', '.docx', '.txt')):
+        current_marks = 2
+        lines = text.splitlines()
+        current_q = []
         
-        if len(line) < 8:
+        def save_q():
+            if current_q:
+                q_text = " ".join(current_q).strip()
+                match = re.search(r"(.*?)\s*[\(\[]\s*(\d+)\s*(?:[mM]arks?|[mM])?\s*[\)\]]\s*$", q_text, re.I)
+                if match:
+                    q_clean = re.sub(r"^(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]?\s*", "", match.group(1), flags=re.I).strip()
+                    extracted_questions.append((q_clean, int(match.group(2))))
+                else:
+                    q_clean = re.sub(r"^(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]?\s*", "", q_text, flags=re.I).strip()
+                    if len(q_clean) > 8:
+                        extracted_questions.append((q_clean, current_marks))
+                current_q.clear()
+
+        for line in lines:
+            line = line.strip().lstrip('\ufeff')
+            if not line:
+                continue
+                
+            sec_match = re.search(r"(?im)^\W*(?:section|part|module)\s*[-_:]?\s*([a-z0-9]+)", line)
+            mark_sec_match = re.search(r"(?im)^\W*(\d+)\s*(?:[mM]arks?)\s*(?:questions?)?", line)
+
+            if sec_match:
+                save_q()
+                sec_val = sec_match.group(1).lower()
+                if sec_val in ['a', '1', 'one']:
+                    current_marks = 2
+                elif sec_val in ['b', '2', 'two']:
+                    current_marks = 8
+                elif sec_val in ['c', '3', 'three']:
+                    current_marks = 15
+                continue
+            elif mark_sec_match:
+                save_q()
+                current_marks = int(mark_sec_match.group(1))
+                continue
+                
+            q_start_match = re.search(r"^(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]\s+(.*)", line, re.I)
+            if q_start_match:
+                save_q()
+                current_q.append(line)
+            else:
+                current_q.append(line)
+                
+        save_q()
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            match = re.search(r"^(?:(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]?\s*)?(.*?)\s*[\(\[]\s*(\d+)\s*(?:[mM]arks?|[mM])?\s*[\)\]]\s*$", line, re.I)
+            if match:
+                q_clean = match.group(1).strip()
+                extracted_questions.append((q_clean, int(match.group(2))))
+            else:
+                match_end = re.search(r"(.*?)\s+(\d+)$", line)
+                if match_end:
+                    q_clean = re.sub(r"^(?:(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]?\s*)?", "", match_end.group(1), flags=re.I).strip()
+                    extracted_questions.append((q_clean, int(match_end.group(2))))
+                else:
+                    q_clean = re.sub(r"^(?:(?:Q(?:uestion)?\s*)?\d+[\.\)\:\-]?\s*)?", "", line, flags=re.I).strip()
+                    if len(q_clean) > 8:
+                        extracted_questions.append((q_clean, 2))
+
+    for q_text, marks in extracted_questions:
+        if len(q_text) < 8:
             continue
 
-        # AI classification.
-        raw_meta = classify_question(line) or {}
-
-        # Keep only fields that actually belong to the Question model.
-        allowed_meta = {
-            "syllabus_id",
-            "unit",
-            "topic",
-            "question_type",
-            "difficulty",
-            "marks",
-            "bloom_level",
-            "course_outcome",
-            "keywords",
-            "options",
-            "answer",
+        meta = {
+            "difficulty": "Medium",
+            "bloom_level": "Understand",
+            "marks": marks
         }
-        meta = {key: value for key, value in raw_meta.items() if key in allowed_meta}
 
         # Duplicate detection within the uploaded subject.
-        new_words = set(re.findall(r"\w+", line.lower()))
+        new_words = set(re.findall(r"\w+", q_text.lower()))
         duplicate_status = "unique"
 
         for existing in existing_questions:
@@ -988,12 +1014,10 @@ async def upload_questions(
         if duplicate_status == "duplicate":
             duplicate_count += 1
 
-        # Syllabus mapping status.
-        mapping_status = "mapped" if (meta.get("unit") or meta.get("topic")) else "needs_review"
-        if mapping_status == "mapped":
-            mapped_count += 1
-        else:
-            review_count += 1
+        mapping_status = "needs_review"
+        review_count += 1
+
+        line = q_text
 
         question = Question(
             subject_id=subject.id,
@@ -1486,6 +1510,45 @@ def generate_paper(
     db: Session = Depends(get_db),
     user=Depends(current_user),
 ):
+    generation_mode = (data.generation_mode or "hybrid").strip().lower()
+    if generation_mode not in {"question_bank", "ai", "hybrid"}:
+        raise HTTPException(
+            400,
+            "Generation source must be Question Bank Only, AI Generated, or Question Bank + AI.",
+        )
+
+    choice_mode = (data.choice_mode or "No Choice").strip().lower()
+    if choice_mode not in {"no choice", "internal choice", "either/or"}:
+        raise HTTPException(
+            400,
+            "Choice mode must be No Choice, Internal Choice, or Either/Or.",
+        )
+    has_internal_choice = choice_mode in {"internal choice", "either/or"}
+
+    section_a_questions = data.section_a_questions
+    section_b_questions = data.section_b_questions
+    section_a_marks = data.section_a_marks
+    section_b_marks = data.section_b_marks
+
+    # Keep the older API shape working when callers only provide total_questions.
+    if section_a_questions == 0 and section_b_questions == 0 and data.total_questions > 0:
+        section_a_questions = data.total_questions
+        section_a_marks = max(1, data.total_marks // data.total_questions)
+
+    if (
+        section_a_questions < 0
+        or section_b_questions < 0
+        or section_a_marks <= 0
+        or section_b_marks <= 0
+        or section_a_questions + section_b_questions == 0
+    ):
+        raise HTTPException(400, "Enter a valid number of questions and marks for each section.")
+    if has_internal_choice and section_b_questions == 0:
+        raise HTTPException(400, "Internal Choice and Either/Or require at least one Section B question slot.")
+
+    total_questions = section_a_questions + section_b_questions * (2 if choice_mode == "either/or" else 1)
+    total_marks = section_a_questions * section_a_marks + section_b_questions * section_b_marks * (2 if choice_mode == "either/or" else 1)
+
     subject = db.get(Subject, data.subject_id)
     if not subject:
         raise HTTPException(404, "Subject not found")
@@ -1500,108 +1563,274 @@ def generate_paper(
         .all()
     )
 
-    if data.generation_mode == "question_bank":
+    if generation_mode != "question_bank" and not questions:
+        raise HTTPException(
+            400,
+            "Upload and approve question-bank questions first. AI generation uses those questions and their marks as its only subject-matter source.",
+        )
+    if generation_mode != "question_bank":
+        requested_marks = {
+            marks
+            for count, marks in (
+                (section_a_questions, section_a_marks),
+                (section_b_questions, section_b_marks),
+            )
+            if count > 0
+        }
+        available_marks = {question.marks for question in questions}
+        missing_marks = sorted(requested_marks - available_marks)
+        if missing_marks:
+            missing = ", ".join(str(marks) for marks in missing_marks)
+            raise HTTPException(
+                400,
+                f"No approved question-bank questions have these required weightages: {missing} mark(s).",
+            )
+
+    if generation_mode == "question_bank":
+        questions_needed = section_a_questions + section_b_questions * (2 if has_internal_choice else 1)
+        section_a_pool = [q for q in questions if q.marks == section_a_marks]
+        section_b_pool = [q for q in questions if q.marks == section_b_marks]
+        required_section_b_questions = section_b_questions * (2 if has_internal_choice else 1)
+        if len(section_a_pool) < section_a_questions or len(section_b_pool) < required_section_b_questions:
+            raise HTTPException(
+                400,
+                "Not enough approved questions in the question bank for the selected marks and choice mode. "
+                f"Need {section_a_questions} question(s) worth {section_a_marks} marks and "
+                f"{required_section_b_questions} question(s) worth {section_b_marks} marks; "
+                f"found {len(section_a_pool)} and {len(section_b_pool)}.",
+            )
+
         content = []
-        q_idx = 0
         num = 1
-        
-        for _ in range(data.section_a_questions or 0):
-            if q_idx < len(questions):
-                q = questions[q_idx]
-                q_idx += 1
+        target_diff = {}
+        target_bloom = {}
+        if data.blueprint_id:
+            blueprint = db.get(Blueprint, data.blueprint_id)
+            if blueprint:
+                target_diff = json.loads(blueprint.difficulty_distribution or "{}")
+                target_bloom = json.loads(blueprint.bloom_distribution or "{}")
+
+        used_question_count = questions_needed
+        difficulty_counts = {}
+        bloom_counts = {}
+
+        def score_question(question):
+            score = 0
+            if target_diff:
+                pct = (difficulty_counts.get(question.difficulty, 0) + 1) / used_question_count * 100
+                if pct <= float(target_diff.get(question.difficulty, 0)):
+                    score += 10
+            if target_bloom:
+                pct = (bloom_counts.get(question.bloom_level, 0) + 1) / used_question_count * 100
+                if pct <= float(target_bloom.get(question.bloom_level, 0)):
+                    score += 10
+            return score + random.random()
+
+        def pick_question(pool):
+            pool.sort(key=score_question, reverse=True)
+            question = pool.pop(0)
+            difficulty_counts[question.difficulty] = difficulty_counts.get(question.difficulty, 0) + 1
+            bloom_counts[question.bloom_level] = bloom_counts.get(question.bloom_level, 0) + 1
+            return question
+
+        random.shuffle(section_a_pool)
+        random.shuffle(section_b_pool)
+        for _ in range(section_a_questions):
+            question = pick_question(section_a_pool)
+            content.append({
+                "number": num,
+                "section": "Section A",
+                "question": question.question_text,
+                "marks": section_a_marks,
+                "unit": question.unit,
+                "topic": question.topic,
+                "difficulty": question.difficulty,
+                "bloom_level": question.bloom_level,
+                "co": question.course_outcome,
+            })
+            num += 1
+
+        for _ in range(section_b_questions):
+            section_b_questions_for_slot = [
+                pick_question(section_b_pool)
+                for _ in range(2 if has_internal_choice else 1)
+            ]
+            if has_internal_choice:
                 content.append({
                     "number": num,
-                    "section": "Section A",
-                    "question": q.question_text,
-                    "marks": data.section_a_marks,
-                    "unit": q.unit,
-                    "topic": q.topic,
-                    "difficulty": q.difficulty,
-                    "bloom_level": q.bloom_level,
-                    "co": q.course_outcome,
+                    "section": "Section B",
+                    "choices": [
+                        {
+                            "question": question.question_text,
+                            "marks": section_b_marks,
+                            "unit": question.unit,
+                            "topic": question.topic,
+                            "difficulty": question.difficulty,
+                            "bloom_level": question.bloom_level,
+                            "co": question.course_outcome,
+                        }
+                        for question in section_b_questions_for_slot
+                    ],
                 })
-                num += 1
-                
-        for _ in range(data.section_b_questions or 0):
-            if data.choice_mode and "internal" in data.choice_mode.lower():
-                if q_idx + 1 < len(questions):
-                    qa = questions[q_idx]
-                    qb = questions[q_idx + 1]
-                    q_idx += 2
+            else:
+                question = section_b_questions_for_slot[0]
+                content.append({
+                    "number": num,
+                    "section": "Section B",
+                    "question": question.question_text,
+                    "marks": section_b_marks,
+                    "unit": question.unit,
+                    "topic": question.topic,
+                    "difficulty": question.difficulty,
+                    "bloom_level": question.bloom_level,
+                    "co": question.course_outcome,
+                })
+            num += 1
+    else:
+        if generation_mode == "ai":
+            source_questions = []
+        else:
+            source_questions = [
+                question for question in questions
+                if question.marks in requested_marks
+            ]
+        blueprint_data = {
+            "total_marks": total_marks,
+            "sections": [
+                {"marks": section_a_marks, "count": section_a_questions},
+                {"marks": section_b_marks, "count": section_b_questions * (2 if has_internal_choice else 1)}
+            ]
+        }
+        try:
+            paper_dict = ai_generate_paper(
+                questions=source_questions,
+                blueprint=blueprint_data,
+                subject=subject.name if subject else "Subject",
+                title=data.title,
+                instructions="",
+            )
+            content = paper_dict.get("sections", [])
+        except Exception as e:
+            raise HTTPException(500, f"AI generation failed: {str(e)}")
+
+        section_a_content = []
+        section_b_content = []
+        for s in content:
+            if "A" in s.get("name", "") or s.get("marks_each") == section_a_marks:
+                section_a_content.extend(s.get("questions", []))
+            elif "B" in s.get("name", "") or s.get("marks_each") == section_b_marks:
+                section_b_content.extend(s.get("questions", []))
+
+        content = []
+        num = 1
+        
+        # Prepare Section A
+        for q in section_a_content:
+            content.append({
+                "number": num,
+                "section": "Section A",
+                "question": q.get("question_text", ""),
+                "marks": section_a_marks,
+                "unit": q.get("unit"),
+                "topic": q.get("topic"),
+                "difficulty": q.get("difficulty"),
+                "bloom_level": q.get("bloom_level"),
+                "co": q.get("course_outcome", ""),
+            })
+            num += 1
+
+        # Prepare Section B
+        if has_internal_choice:
+            # Group into pairs
+            for i in range(0, len(section_b_content), 2):
+                if i + 1 < len(section_b_content):
+                    qa = section_b_content[i]
+                    qb = section_b_content[i+1]
                     content.append({
                         "number": num,
                         "section": "Section B",
                         "choices": [
                             {
-                                "question": qa.question_text,
-                                "marks": data.section_b_marks,
-                                "unit": qa.unit,
-                                "topic": qa.topic,
-                                "difficulty": qa.difficulty,
-                                "bloom_level": qa.bloom_level,
-                                "co": qa.course_outcome,
+                                "question": qa.get("question_text", ""),
+                                "marks": section_b_marks,
+                                "unit": qa.get("unit"),
+                                "topic": qa.get("topic"),
+                                "difficulty": qa.get("difficulty"),
+                                "bloom_level": qa.get("bloom_level"),
+                                "co": qa.get("course_outcome", ""),
                             },
                             {
-                                "question": qb.question_text,
-                                "marks": data.section_b_marks,
-                                "unit": qb.unit,
-                                "topic": qb.topic,
-                                "difficulty": qb.difficulty,
-                                "bloom_level": qb.bloom_level,
-                                "co": qb.course_outcome,
+                                "question": qb.get("question_text", ""),
+                                "marks": section_b_marks,
+                                "unit": qb.get("unit"),
+                                "topic": qb.get("topic"),
+                                "difficulty": qb.get("difficulty"),
+                                "bloom_level": qb.get("bloom_level"),
+                                "co": qb.get("course_outcome", ""),
                             }
                         ]
                     })
                     num += 1
-            else:
-                if q_idx < len(questions):
-                    q = questions[q_idx]
-                    q_idx += 1
+                else:
+                    q = section_b_content[i]
                     content.append({
                         "number": num,
                         "section": "Section B",
-                        "question": q.question_text,
-                        "marks": data.section_b_marks,
-                        "unit": q.unit,
-                        "topic": q.topic,
-                        "difficulty": q.difficulty,
-                        "bloom_level": q.bloom_level,
-                        "co": q.course_outcome,
+                        "question": q.get("question_text", ""),
+                        "marks": section_b_marks,
+                        "unit": q.get("unit"),
+                        "topic": q.get("topic"),
+                        "difficulty": q.get("difficulty"),
+                        "bloom_level": q.get("bloom_level"),
+                        "co": q.get("course_outcome", ""),
                     })
                     num += 1
-    else:
-        instructions = data.instructions or f"Section A: {data.section_a_questions} questions of {data.section_a_marks} marks each. Section B: {data.section_b_questions} questions of {data.section_b_marks} marks each."
-        
-        syllabus_text = ""
-        if data.syllabus_id:
-            syllabus = db.get(Syllabus, data.syllabus_id)
-            if syllabus:
-                syllabus_text = syllabus.extracted_text
-
-        blueprint_text = ""
-        if data.blueprint_id:
-            blueprint = db.get(Blueprint, data.blueprint_id)
-            if blueprint:
-                blueprint_text = json.dumps({
-                    "question_pattern": json.loads(blueprint.question_pattern or "{}"),
-                    "unit_weightage": json.loads(blueprint.unit_weightage or "{}"),
-                    "difficulty_distribution": json.loads(blueprint.difficulty_distribution or "{}"),
-                    "bloom_distribution": json.loads(blueprint.bloom_distribution or "{}"),
-                    "co_distribution": json.loads(blueprint.co_distribution or "{}")
+        else:
+            for q in section_b_content:
+                content.append({
+                    "number": num,
+                    "section": "Section B",
+                    "question": q.get("question_text", ""),
+                    "marks": section_b_marks,
+                    "unit": q.get("unit"),
+                    "topic": q.get("topic"),
+                    "difficulty": q.get("difficulty"),
+                    "bloom_level": q.get("bloom_level"),
+                    "co": q.get("course_outcome", ""),
                 })
+                num += 1
 
-        content = ai_generate_paper(
-            subject=subject,
-            questions=questions if data.generation_mode == "hybrid" else [],
-            total_marks=data.total_marks,
-            total_questions=data.total_questions,
-            duration=data.duration,
-            choice_mode=data.choice_mode,
-            topics=data.topics,
-            instructions=instructions,
-            syllabus_text=syllabus_text,
-            blueprint_text=blueprint_text
-        )
+    # =========================================================================
+    # STRICT VALIDATION BEFORE DISPLAYING (Req 7)
+    # =========================================================================
+    seen_q = set()
+    val_a = 0
+    val_b = 0
+    for item in content:
+        qs_in_slot = item.get("choices", [item]) if "choices" in item else [item]
+        for q in qs_in_slot:
+            qt = q.get("question", "").strip().lower()
+            if not qt:
+                raise HTTPException(400, "Validation Failed: Blank question generated.")
+            if qt in seen_q:
+                raise HTTPException(400, f"Validation Failed: Duplicate question detected -> {qt[:50]}")
+            seen_q.add(qt)
+            
+            # Verify Section Marks
+            if item.get("section") == "Section A" and q.get("marks") != section_a_marks:
+                raise HTTPException(400, f"Validation Failed: Section A mixed marks detected. Expected {section_a_marks}.")
+            if item.get("section") == "Section B" and q.get("marks") != section_b_marks:
+                raise HTTPException(400, f"Validation Failed: Section B mixed marks detected. Expected {section_b_marks}.")
+                
+        if item.get("section") == "Section A":
+            val_a += 1
+        else:
+            val_b += 1
+
+    if val_a != section_a_questions:
+        raise HTTPException(400, f"Validation Failed: Expected {section_a_questions} Section A questions, generated {val_a}.")
+    if val_b != section_b_questions:
+        raise HTTPException(400, f"Validation Failed: Expected {section_b_questions} Section B slots, generated {val_b}.")
 
     paper = Paper(
         subject_id=data.subject_id,
@@ -1610,7 +1839,7 @@ def generate_paper(
         title=data.title,
         exam_type=data.exam_type,
         duration=data.duration,
-        total_marks=data.total_marks,
+        total_marks=total_marks,
         total_questions=len(content),
         paper_content=json.dumps(content),
         validation_result=json.dumps(
@@ -1631,6 +1860,13 @@ def generate_paper(
         "id": paper.id,
         "content": content,
         "message": "Paper generated",
+        "generation_mode": generation_mode,
+        "generation_mode_label": {
+            "question_bank": "Question Bank Only",
+            "ai": "AI Generated",
+            "hybrid": "Question Bank + AI for Missing Questions",
+        }[generation_mode],
+        "choice_mode": data.choice_mode,
     }
 
 
@@ -1937,9 +2173,8 @@ def generate_key(
             data.question_text,
             data.marks
         )
-    except Exception:
-        from ..services.academic_kb import get_academic_answer
-        answer, points = get_academic_answer(data.question_text, data.marks)
+    except Exception as e:
+        raise HTTPException(500, f"AI generation failed: {str(e)}")
 
     ak_id = None
     try:
@@ -2284,9 +2519,8 @@ def assistant_chat(
 
     try:
         answer = assistant_answer(question, context=context)
-    except Exception:
-        from ..services.academic_kb import get_assistant_response
-        answer = get_assistant_response(question)
+    except Exception as e:
+        raise HTTPException(500, f"AI assistant failed: {str(e)}")
 
     return {"answer": answer}
 
@@ -2300,4 +2534,3 @@ def update_question(qid: int, data: dict, db: Session = Depends(get_db), user=De
             setattr(q, k, v)
     db.commit()
     return {"message": "Question updated"}
-
