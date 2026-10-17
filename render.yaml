@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: aiqpg-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: CORS_ALLOW_ALL
+        value: "true"
+      - key: COLLEGE_EMAIL_DOMAINS
+        value: apollouniversity.edu.in
+      - key: ADMIN_SIGNUP_CODE
+        value: Admin@2026
+      - key: AI_PROVIDER
+        value: openai
+      - key: AI_FALLBACK_ENABLED
+        value: "true"
+      - key: AI_FALLBACK_PROVIDERS
+        value: openrouter,grok
