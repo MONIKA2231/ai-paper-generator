@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState, useRef } from 'react';
-import { generateLocalAcademicAnswer, generateLocalAssistantResponse } from './academicEngine';
+import { generateLocalAcademicAnswer, generateLocalAssistantResponse, parseClientQuestionPaperText } from './academicEngine';
 import {
   LayoutDashboard,
   BookOpen,
@@ -2445,14 +2445,39 @@ function formatAnswerText(text) {
 }
 
 function AnswerKeys() {
+  const [tab, setTab] = useState('upload'); // 'upload' | 'single' | 'saved'
   const [subjects, setSubjects] = useState([]);
   const [sid, setSid] = usePersistedState('aiqpg_answer_sid', '');
+  const [paperTitle, setPaperTitle] = usePersistedState('aiqpg_answer_title', '');
+  
+  // Upload Mode State
+  const [uploadMethod, setUploadMethod] = useState('file'); // 'file' | 'paste'
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [pastedText, setPastedText] = useState('');
+  const [extracting, setExtracting] = useState(false);
+  const [extractedQs, setExtractedQs] = useState([]);
+  const [generatingPaper, setGeneratingPaper] = useState(false);
+  const [paperResult, setPaperResult] = usePersistedState('aiqpg_paper_answer_result', null);
+  const [editingQIdx, setEditingQIdx] = useState(null);
+  const [editAnswerText, setEditAnswerText] = useState('');
+  const [editPointsText, setEditPointsText] = useState('');
+  const [regenBusyIdx, setRegenBusyIdx] = useState(null);
+  const [statusMsg, setStatusMsg] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
+
+  // Single Question Mode State
   const [qs, setQs] = useState([]);
-  const [selected, setSelected] = usePersistedState('aiqpg_answer_selected', '');
-  const [marks, setMarks] = usePersistedState('aiqpg_answer_marks', 5);
-  const [result, setResult] = usePersistedState('aiqpg_answer_result', null);
-  const [msg, setMsg] = useState('');
-  const [busy, setBusy] = useState(false);
+  const [singleSource, setSingleSource] = useState('bank'); // 'bank' | 'custom'
+  const [selectedQId, setSelectedQId] = usePersistedState('aiqpg_answer_selected', '');
+  const [customQuestion, setCustomQuestion] = useState('');
+  const [singleMarks, setSingleMarks] = usePersistedState('aiqpg_answer_marks', 5);
+  const [singleResult, setSingleResult] = usePersistedState('aiqpg_answer_result', null);
+  const [singleBusy, setSingleBusy] = useState(false);
+
+  // Saved Answer Keys State
+  const [savedKeys, setSavedKeys] = useState([]);
+  const [loadingSaved, setLoadingSaved] = useState(false);
+  const [savedSearch, setSavedSearch] = useState('');
 
   useEffect(() => {
     api('/subjects')
@@ -2461,148 +2486,1207 @@ function AnswerKeys() {
   }, []);
 
   useEffect(() => {
-    if (sid)
+    if (sid) {
       api(`/questions?subject_id=${sid}`)
         .then((d) => setQs(safeArray(d)))
         .catch(() => setQs([]));
-    else setQs([]);
+    } else {
+      setQs([]);
+    }
   }, [sid]);
 
-  const gen = async () => {
-    const safeQs = safeArray(qs);
-    const q = safeQs.find((x) => x.id === Number(selected));
-    if (!q) return;
+  const loadSavedKeys = () => {
+    setLoadingSaved(true);
+    api('/answer-keys')
+      .then((d) => setSavedKeys(safeArray(d)))
+      .catch(() => setSavedKeys([]))
+      .finally(() => setLoadingSaved(false));
+  };
 
-    setBusy(true);
-    setMsg('');
+  useEffect(() => {
+    if (tab === 'saved') loadSavedKeys();
+  }, [tab]);
+
+  // Extract questions from uploaded file or pasted text
+  const handleExtract = async () => {
+    setErrorMsg('');
+    setStatusMsg('');
+
+    if (uploadMethod === 'file' && !selectedFile) {
+      setErrorMsg('Please select a question paper file (PDF, DOCX, TXT) to upload.');
+      return;
+    }
+    if (uploadMethod === 'paste' && !pastedText.trim()) {
+      setErrorMsg('Please paste your question paper text into the box.');
+      return;
+    }
+
+    setExtracting(true);
+    try {
+      let parsed = null;
+      if (uploadMethod === 'file') {
+        const formData = new FormData();
+        formData.append('file', selectedFile);
+        if (sid) formData.append('subject_id', sid);
+        if (paperTitle) formData.append('paper_title', paperTitle);
+
+        parsed = await api('/answer-keys/upload-paper', {
+          method: 'POST',
+          body: formData,
+        });
+      } else {
+        const formData = new FormData();
+        formData.append('text_content', pastedText);
+        if (sid) formData.append('subject_id', sid);
+        if (paperTitle) formData.append('paper_title', paperTitle);
+
+        try {
+          parsed = await api('/answer-keys/upload-paper', {
+            method: 'POST',
+            body: formData,
+          });
+        } catch {
+          // Client-side fallback extraction
+          const clientQs = parseClientQuestionPaperText(pastedText);
+          if (!clientQs || clientQs.length === 0) {
+            throw new Error('No questions detected in pasted text. Please verify numbering.');
+          }
+          parsed = {
+            paper_title: paperTitle || 'Uploaded Question Paper',
+            subject_id: sid,
+            total_questions: clientQs.length,
+            total_marks: clientQs.reduce((acc, q) => acc + (q.marks || 2), 0),
+            questions: clientQs,
+          };
+        }
+      }
+
+      if (!parsed || !parsed.questions || parsed.questions.length === 0) {
+        throw new Error('No questions could be detected. Please verify your question paper contains numbered questions or mark weightages.');
+      }
+
+      setExtractedQs(parsed.questions);
+      if (parsed.paper_title && !paperTitle) setPaperTitle(parsed.paper_title);
+      setStatusMsg(`Successfully extracted ${parsed.questions.length} questions (${parsed.total_marks || 0} total marks). Review and customize weightages below, then generate the full answer key.`);
+    } catch (e) {
+      setErrorMsg(e.message || 'Unable to extract questions from the uploaded question paper.');
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  // Modify individual question in extracted list
+  const updateExtractedQ = (idx, field, val) => {
+    setExtractedQs((prev) => {
+      const copy = [...prev];
+      copy[idx] = { ...copy[idx], [field]: val };
+      return copy;
+    });
+  };
+
+  const removeExtractedQ = (idx) => {
+    setExtractedQs((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const addManualQuestion = () => {
+    setExtractedQs((prev) => [
+      ...prev,
+      {
+        number: prev.length + 1,
+        section: prev.length > 0 ? prev[prev.length - 1].section || 'Section A' : 'Section A',
+        question_text: '',
+        marks: 5,
+      },
+    ]);
+  };
+
+  // Generate complete answer key for the question paper
+  const handleGeneratePaperKey = async () => {
+    if (!extractedQs || extractedQs.length === 0) return;
+    setErrorMsg('');
+    setStatusMsg('');
+    setGeneratingPaper(true);
+
+    const sub = safeArray(subjects).find((s) => s.id === Number(sid));
+    const subName = sub ? `${sub.code} - ${sub.name}` : 'General Academic';
+
+    try {
+      const res = await api('/answer-keys/generate-paper', {
+        method: 'POST',
+        body: JSON.stringify({
+          paper_title: paperTitle || 'Question Paper Answer Key',
+          subject_id: sid ? Number(sid) : null,
+          questions: extractedQs.map((q) => ({
+            number: q.number,
+            section: q.section || 'General',
+            question_text: q.question_text,
+            marks: Number(q.marks) || 2,
+          })),
+        }),
+      });
+
+      setPaperResult(res);
+      setStatusMsg(`Generated complete answer key for ${res.total_questions} questions with weightage-scaled answers and key points!`);
+    } catch {
+      // Local resilience fallback
+      const fallbackResults = extractedQs.map((q, idx) => {
+        const m = Number(q.marks) || 2;
+        const local = generateLocalAcademicAnswer(q.question_text, m);
+        return {
+          id: Date.now() + idx,
+          number: q.number || idx + 1,
+          section: q.section || 'General',
+          question_text: q.question_text,
+          marks: m,
+          answer: local.answer,
+          key_points: local.key_points,
+        };
+      });
+
+      const res = {
+        paper_title: paperTitle || 'Question Paper Answer Key',
+        subject_id: sid ? Number(sid) : null,
+        subject_name: subName,
+        total_questions: fallbackResults.length,
+        total_marks: fallbackResults.reduce((acc, q) => acc + q.marks, 0),
+        results: fallbackResults,
+      };
+
+      setPaperResult(res);
+      setStatusMsg(`Generated academic answer key for ${res.total_questions} questions with weightage-scaled answers and key points!`);
+    } finally {
+      setGeneratingPaper(false);
+    }
+  };
+
+  // Regenerate single question answer inside paper result
+  const handleRegenerateItem = async (idx) => {
+    if (!paperResult || !paperResult.results || !paperResult.results[idx]) return;
+    const item = paperResult.results[idx];
+    setRegenBusyIdx(idx);
+    setErrorMsg('');
+
+    try {
+      const res = await api('/answer-keys/generate', {
+        method: 'POST',
+        body: JSON.stringify({
+          question_text: item.question_text,
+          marks: item.marks,
+          subject_id: sid ? Number(sid) : null,
+        }),
+      });
+
+      setPaperResult((prev) => {
+        const copy = { ...prev };
+        copy.results = [...copy.results];
+        copy.results[idx] = {
+          ...copy.results[idx],
+          answer: res.answer,
+          key_points: res.key_points,
+        };
+        return copy;
+      });
+      setStatusMsg(`Regenerated answer and key points for Question ${item.number || idx + 1}.`);
+    } catch {
+      const local = generateLocalAcademicAnswer(item.question_text, item.marks);
+      setPaperResult((prev) => {
+        const copy = { ...prev };
+        copy.results = [...copy.results];
+        copy.results[idx] = {
+          ...copy.results[idx],
+          answer: local.answer,
+          key_points: local.key_points,
+        };
+        return copy;
+      });
+      setStatusMsg(`Regenerated answer and key points for Question ${item.number || idx + 1}.`);
+    } finally {
+      setRegenBusyIdx(null);
+    }
+  };
+
+  // Start inline editing an answer
+  const startEditingQ = (idx) => {
+    const item = paperResult.results[idx];
+    setEditingQIdx(idx);
+    setEditAnswerText(item.answer || '');
+    setEditPointsText(Array.isArray(item.key_points) ? item.key_points.join('\n') : '');
+  };
+
+  const saveEditedQ = () => {
+    if (editingQIdx === null || !paperResult) return;
+    const updatedPoints = editPointsText
+      .split('\n')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+
+    setPaperResult((prev) => {
+      const copy = { ...prev };
+      copy.results = [...copy.results];
+      copy.results[editingQIdx] = {
+        ...copy.results[editingQIdx],
+        answer: editAnswerText,
+        key_points: updatedPoints,
+      };
+      return copy;
+    });
+
+    const item = paperResult.results[editingQIdx];
+    if (item.id) {
+      api(`/answer-keys/${item.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          question_text: item.question_text,
+          marks: item.marks,
+          answer: editAnswerText,
+        }),
+      }).catch(() => {});
+    }
+
+    setEditingQIdx(null);
+    setStatusMsg(`Updated answer and key points for Question ${item.number || editingQIdx + 1}.`);
+  };
+
+  // Batch finalize all answer keys
+  const handleBatchFinalize = async () => {
+    if (!paperResult || !paperResult.results) return;
+    const ids = paperResult.results.map((r) => r.id).filter(Boolean);
+    if (ids.length === 0) {
+      setStatusMsg('Answer key saved as finalized.');
+      return;
+    }
+    try {
+      const res = await api('/answer-keys/batch-finalize', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+      setStatusMsg(res.message || 'All answer keys finalized and approved successfully.');
+    } catch (e) {
+      setErrorMsg(e.message || 'Unable to batch finalize.');
+    }
+  };
+
+  // Print Answer Key
+  const handlePrint = () => {
+    if (!paperResult || !paperResult.results) return;
+    const w = window.open('', '_blank', 'width=950,height=750');
+    if (!w) {
+      alert('Please allow pop-ups to print the answer key.');
+      return;
+    }
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>${paperResult.paper_title || 'Academic Answer Key'}</title>
+  <style>
+    body { font-family: 'Times New Roman', Times, Georgia, serif; line-height: 1.6; color: #111; padding: 32px 40px; margin: 0; background: #fff; }
+    .header { text-align: center; border-bottom: 2px solid #000; padding-bottom: 12px; margin-bottom: 24px; }
+    .header h1 { font-size: 22px; text-transform: uppercase; margin: 0 0 6px 0; letter-spacing: 0.5px; }
+    .header h2 { font-size: 16px; margin: 0 0 8px 0; color: #333; }
+    .header .meta { display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; margin-top: 8px; }
+    .question-block { margin-bottom: 26px; page-break-inside: avoid; border-bottom: 1px dashed #ccc; padding-bottom: 18px; }
+    .question-header { font-weight: bold; font-size: 14px; margin-bottom: 6px; display: flex; justify-content: space-between; }
+    .question-text { font-size: 14px; color: #000; margin-bottom: 10px; }
+    .marks-badge { font-weight: bold; font-size: 13px; color: #1e3a8a; }
+    .answer-container { background: #fafafa; border-left: 3px solid #1e3a8a; padding: 12px 16px; margin-bottom: 12px; font-size: 13px; }
+    .answer-container h4 { margin: 0 0 6px 0; font-size: 13px; text-transform: uppercase; color: #1e3a8a; }
+    .answer-body { white-space: pre-wrap; font-family: Georgia, serif; }
+    .rubric-box { border: 1px solid #94a3b8; background: #f8fafc; padding: 10px 14px; border-radius: 4px; font-size: 12px; margin-top: 8px; }
+    .rubric-title { font-weight: bold; margin-bottom: 6px; font-size: 12px; text-transform: uppercase; color: #059669; }
+    .rubric-item { margin: 4px 0; display: flex; gap: 8px; }
+    @media print {
+      body { padding: 12mm; }
+      .question-block { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>${paperResult.paper_title || 'OFFICIAL UNIVERSITY ANSWER KEY & MARKING SCHEME'}</h1>
+    <h2>Subject: ${paperResult.subject_name || 'Academic Curriculum'}</h2>
+    <div class="meta">
+      <span>Total Questions: ${paperResult.total_questions || paperResult.results.length}</span>
+      <span>Total Marks: ${paperResult.total_marks || 0}</span>
+      <span>Marking Scheme: Weightage-Scaled Rubric</span>
+    </div>
+  </div>
+  ${paperResult.results
+    .map(
+      (q, idx) => `
+    <div class="question-block">
+      <div class="question-header">
+        <span>Question ${q.number || idx + 1} (${q.section || 'General'})</span>
+        <span class="marks-badge">[${q.marks} Marks Weightage]</span>
+      </div>
+      <div class="question-text"><strong>Q:</strong> ${q.question_text}</div>
+      <div class="answer-container">
+        <h4>Model Academic Answer:</h4>
+        <div class="answer-body">${String(q.answer || '')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')}</div>
+      </div>
+      ${
+        Array.isArray(q.key_points) && q.key_points.length > 0
+          ? `
+        <div class="rubric-box">
+          <div class="rubric-title">Scoring Key Points & Weightage Rubric (${q.marks} Marks):</div>
+          ${q.key_points
+            .map(
+              (pt) => `
+            <div class="rubric-item">
+              <span>&#10003;</span>
+              <span>${String(pt).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>
+            </div>
+          `
+            )
+            .join('')}
+        </div>
+      `
+          : ''
+      }
+    </div>
+  `
+    )
+    .join('')}
+</body>
+</html>`;
+
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+    w.focus();
+    setTimeout(() => w.print(), 350);
+  };
+
+  // Download Answer Key as Plain Text
+  const handleDownloadTxt = () => {
+    if (!paperResult || !paperResult.results) return;
+    let txt = `========================================================================\n`;
+    txt += `${paperResult.paper_title || 'OFFICIAL QUESTION PAPER ANSWER KEY'}\n`;
+    txt += `Subject: ${paperResult.subject_name || 'General'}\n`;
+    txt += `Total Questions: ${paperResult.total_questions || paperResult.results.length} | Total Marks: ${paperResult.total_marks || 0}\n`;
+    txt += `========================================================================\n\n`;
+
+    paperResult.results.forEach((q, idx) => {
+      txt += `------------------------------------------------------------------------\n`;
+      txt += `QUESTION ${q.number || idx + 1} [${q.section || 'General'}] -- [${q.marks} MARKS]\n`;
+      txt += `------------------------------------------------------------------------\n`;
+      txt += `${q.question_text}\n\n`;
+      txt += `MODEL ANSWER:\n`;
+      txt += `${q.answer}\n\n`;
+      if (Array.isArray(q.key_points) && q.key_points.length > 0) {
+        txt += `SCORING KEY POINTS & WEIGHTAGE RUBRIC (${q.marks} MARKS):\n`;
+        q.key_points.forEach((pt) => {
+          txt += `  * ${pt}\n`;
+        });
+        txt += `\n`;
+      }
+    });
+
+    const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${String(paperResult.paper_title || 'answer-key').replace(/[^a-z0-9]+/gi, '_')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // Generate single question answer
+  const handleGenSingle = async () => {
+    let qText = '';
+    if (singleSource === 'bank') {
+      const q = safeArray(qs).find((x) => x.id === Number(selectedQId));
+      if (!q) {
+        setErrorMsg('Please select a question from the question bank.');
+        return;
+      }
+      qText = q.question_text;
+    } else {
+      qText = customQuestion.trim();
+      if (!qText) {
+        setErrorMsg('Please enter a question to generate an answer for.');
+        return;
+      }
+    }
+
+    setSingleBusy(true);
+    setStatusMsg('');
+    setErrorMsg('');
+
     try {
       const d = await api('/answer-keys/generate', {
         method: 'POST',
         body: JSON.stringify({
-          question_id: q.id,
-          question_text: q.question_text,
-          marks: Number(marks),
+          question_text: qText,
+          marks: Number(singleMarks) || 2,
+          subject_id: sid ? Number(sid) : null,
         }),
       });
-      setResult(d);
-      setMsg('Answer key generated successfully with highlighted headings and key points.');
-    } catch (e) {
-      const fallback = generateLocalAcademicAnswer(q.question_text, marks);
-      setResult({
+      setSingleResult({
+        ...d,
+        marks: Number(singleMarks) || 2,
+        question_text: qText,
+      });
+      setStatusMsg('Answer key generated successfully with highlighted headings and weightage-based key points.');
+    } catch {
+      const fallback = generateLocalAcademicAnswer(qText, singleMarks);
+      setSingleResult({
         id: Date.now(),
-        question_id: q.id,
+        question_text: qText,
+        marks: Number(singleMarks) || 2,
         answer: fallback.answer,
         key_points: fallback.key_points,
       });
-      setMsg('Answer key generated successfully with highlighted headings and key points.');
+      setStatusMsg('Answer key generated successfully with highlighted headings and weightage-based key points.');
     } finally {
-      setBusy(false);
+      setSingleBusy(false);
     }
   };
 
-  const safePoints = safeArray(result?.key_points);
+  const calculatedTotalMarks = extractedQs.reduce((acc, q) => acc + (Number(q.marks) || 0), 0);
 
   return (
     <Module
       title="Answer Key Generator"
-      subtitle="Generate a complete, mark-scaled answer with highlighted headings and key points."
+      subtitle="Upload an exam question paper or select questions to generate academic model answers with weightage-scaled scoring key points."
     >
-      <div className="form-grid">
-        <Field label="Subject">
-          <select value={sid} onChange={(e) => setSid(e.target.value)}>
-            <option value="">Select Subject</option>
-            {safeArray(subjects).map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.code} - {s.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="Question">
-          <select value={selected} onChange={(e) => setSelected(e.target.value)}>
-            <option value="">Select Question</option>
-            {safeArray(qs).map((q) => (
-              <option key={q.id} value={q.id}>
-                {String(q.question_text || '').slice(0, 100)}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="Marks">
-          <input
-            type="number"
-            min="1"
-            value={marks}
-            onChange={(e) => setMarks(e.target.value)}
-          />
-        </Field>
+      {/* Tab Navigation */}
+      <div style={{ display: 'flex', gap: '8px', borderBottom: '2px solid #e2e8f0', marginBottom: '22px' }}>
+        <button
+          className={tab === 'upload' ? 'primary' : 'secondary'}
+          style={{ borderRadius: '8px 8px 0 0', padding: '10px 18px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}
+          onClick={() => setTab('upload')}
+        >
+          <Upload size={16} /> Upload Question Paper
+        </button>
+        <button
+          className={tab === 'single' ? 'primary' : 'secondary'}
+          style={{ borderRadius: '8px 8px 0 0', padding: '10px 18px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}
+          onClick={() => setTab('single')}
+        >
+          <KeyRound size={16} /> Single Question Generator
+        </button>
+        <button
+          className={tab === 'saved' ? 'primary' : 'secondary'}
+          style={{ borderRadius: '8px 8px 0 0', padding: '10px 18px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}
+          onClick={() => setTab('saved')}
+        >
+          <Archive size={16} /> Saved Answer Keys
+        </button>
       </div>
-      <button className="primary" disabled={!selected || busy} onClick={gen}>
-        <KeyRound size={16} /> {busy ? 'Generating Answer & Key Points…' : 'Generate Answer'}
-      </button>
 
-      {msg && <div className="notice">{msg}</div>}
+      {statusMsg && <div className="notice" style={{ marginBottom: '16px' }}>{statusMsg}</div>}
+      {errorMsg && <div className="alert error" style={{ marginBottom: '16px' }}>{errorMsg}</div>}
 
-      {result && (
-        <div className="answer-card" style={{ marginTop: '20px', padding: '22px' }}>
-          <h3
-            style={{
-              margin: '0 0 16px 0',
-              fontSize: '18px',
-              color: '#0f172a',
-              borderBottom: '1px solid #e2e8f0',
-              paddingBottom: '10px',
-            }}
-          >
-            Academic Answer Key ({result.marks || marks} Marks)
-          </h3>
+      {/* TAB 1: UPLOAD QUESTION PAPER */}
+      {tab === 'upload' && (
+        <div>
+          {/* If no paper generated yet, or user wants to modify input */}
+          {!paperResult && (
+            <div className="panel" style={{ padding: '20px', marginBottom: '20px' }}>
+              <h3 style={{ margin: '0 0 16px 0', fontSize: '17px', color: '#0f172a', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <FileText size={18} color="#2563eb" /> Upload & Parse Question Paper
+              </h3>
 
-          <div className="answer-body">{formatAnswerText(result.answer)}</div>
+              <div className="form-grid">
+                <Field label="Subject">
+                  <select value={sid} onChange={(e) => setSid(e.target.value)}>
+                    <option value="">Select Subject (Optional)</option>
+                    {safeArray(subjects).map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.code} - {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Paper Title">
+                  <input
+                    placeholder="e.g. End Semester Exam - Artificial Intelligence"
+                    value={paperTitle}
+                    onChange={(e) => setPaperTitle(e.target.value)}
+                  />
+                </Field>
+              </div>
 
-          {safePoints.length > 0 && (
-            <div
-              style={{
-                marginTop: '24px',
-                background: '#f8fafc',
-                border: '1px solid #e2e8f0',
-                borderRadius: '12px',
-                padding: '18px',
-              }}
-            >
-              <h4
-                style={{
-                  margin: '0 0 14px 0',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  color: '#0f172a',
-                  fontSize: '15px',
-                  fontWeight: 700,
-                }}
-              >
-                <CheckCircle2 size={18} color="#059669" /> Important Key Points Summary
-              </h4>
-              <div style={{ display: 'grid', gap: '8px' }}>
-                {safePoints.map((point, i) => (
+              {/* Upload Method Selector */}
+              <div style={{ display: 'flex', gap: '16px', margin: '16px 0 12px 0' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '14px', color: uploadMethod === 'file' ? '#2563eb' : '#475569' }}>
+                  <input
+                    type="radio"
+                    name="upload_method"
+                    checked={uploadMethod === 'file'}
+                    onChange={() => setUploadMethod('file')}
+                  />
+                  Upload File (PDF, DOCX, TXT, XLSX, CSV)
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '14px', color: uploadMethod === 'paste' ? '#2563eb' : '#475569' }}>
+                  <input
+                    type="radio"
+                    name="upload_method"
+                    checked={uploadMethod === 'paste'}
+                    onChange={() => setUploadMethod('paste')}
+                  />
+                  Paste Question Paper Text
+                </label>
+              </div>
+
+              {uploadMethod === 'file' ? (
+                <div
+                  style={{
+                    border: '2px dashed #cbd5e1',
+                    borderRadius: '12px',
+                    padding: '24px',
+                    textAlign: 'center',
+                    background: '#f8fafc',
+                    cursor: 'pointer',
+                    marginTop: '8px',
+                  }}
+                  onClick={() => document.getElementById('qp_file_input')?.click()}
+                >
+                  <input
+                    id="qp_file_input"
+                    type="file"
+                    accept=".pdf,.docx,.doc,.txt,.csv,.xlsx"
+                    style={{ display: 'none' }}
+                    onChange={(e) => {
+                      if (e.target.files?.[0]) setSelectedFile(e.target.files[0]);
+                    }}
+                  />
+                  <Upload size={32} color="#64748b" style={{ margin: '0 auto 8px auto', display: 'block' }} />
+                  {selectedFile ? (
+                    <div>
+                      <b style={{ color: '#0f172a' }}>{selectedFile.name}</b>
+                      <div style={{ fontSize: '12px', color: '#64748b', marginTop: '4px' }}>
+                        {(selectedFile.size / 1024).toFixed(1)} KB · Click to change file
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <b style={{ color: '#1e293b' }}>Click or drag question paper file here</b>
+                      <p style={{ margin: '4px 0 0 0', fontSize: '13px', color: '#64748b' }}>
+                        Supported formats: PDF (.pdf), Word (.docx), Text (.txt), Excel (.xlsx), CSV (.csv)
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ marginTop: '8px' }}>
+                  <textarea
+                    rows={8}
+                    style={{ width: '100%', fontFamily: 'monospace', fontSize: '13px', padding: '12px', borderRadius: '8px', border: '1px solid #cbd5e1' }}
+                    placeholder="Paste full question paper text here, e.g.:&#10;SECTION A (2 MARKS)&#10;1. Define Artificial Intelligence.&#10;2. What is Machine Learning?&#10;&#10;SECTION B (8 MARKS)&#10;3. Explain Convolutional Neural Networks with an architectural diagram."
+                    value={pastedText}
+                    onChange={(e) => setPastedText(e.target.value)}
+                  />
+                </div>
+              )}
+
+              <div style={{ marginTop: '16px', display: 'flex', gap: '10px' }}>
+                <button
+                  className="primary"
+                  disabled={extracting || (uploadMethod === 'file' && !selectedFile) || (uploadMethod === 'paste' && !pastedText.trim())}
+                  onClick={handleExtract}
+                >
+                  <Search size={16} /> {extracting ? 'Extracting Questions & Weightages…' : 'Extract Questions & Marks'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Extracted Questions Review & Weightage Customization */}
+          {!paperResult && extractedQs.length > 0 && (
+            <div className="panel" style={{ padding: '22px', marginBottom: '22px', border: '1px solid #e2e8f0' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px', marginBottom: '16px' }}>
+                <div>
+                  <h3 style={{ margin: '0 0 4px 0', fontSize: '17px', color: '#0f172a' }}>
+                    Review Questions & Weightages
+                  </h3>
+                  <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                    <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', padding: '4px 10px', borderRadius: '6px', fontSize: '12px', fontWeight: 700 }}>
+                      {extractedQs.length} Questions
+                    </span>
+                    <span className="badge" style={{ background: '#ecfdf5', color: '#065f46', padding: '4px 10px', borderRadius: '6px', fontSize: '12px', fontWeight: 700 }}>
+                      Total: {calculatedTotalMarks} Marks
+                    </span>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <button className="secondary" onClick={addManualQuestion}>
+                    <Plus size={15} /> Add Question
+                  </button>
+                  <button
+                    className="primary"
+                    disabled={generatingPaper || extractedQs.length === 0}
+                    onClick={handleGeneratePaperKey}
+                    style={{ background: '#4f46e5' }}
+                  >
+                    <Sparkles size={16} /> {generatingPaper ? 'Generating Weightage-Based Answers…' : 'Generate Complete Answer Key'}
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gap: '12px' }}>
+                {extractedQs.map((q, idx) => (
                   <div
-                    key={i}
+                    key={idx}
                     style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: '10px',
                       background: '#fff',
-                      padding: '10px 14px',
-                      borderRadius: '8px',
                       border: '1px solid #e2e8f0',
+                      borderRadius: '10px',
+                      padding: '14px 16px',
+                      display: 'grid',
+                      gridTemplateColumns: '80px 1fr 140px 40px',
+                      gap: '12px',
+                      alignItems: 'center',
                     }}
                   >
-                    <span style={{ color: '#059669', fontWeight: 800, marginTop: '1px' }}>✓</span>
-                    <span style={{ fontSize: '13px', color: '#334155', lineHeight: 1.5 }}>
-                      {String(point).replaceAll('**', '').replaceAll('*', '')}
-                    </span>
+                    {/* Section Label */}
+                    <div>
+                      <input
+                        style={{ fontSize: '12px', padding: '6px 8px', width: '100%', fontWeight: 600, color: '#475569' }}
+                        value={q.section || 'General'}
+                        onChange={(e) => updateExtractedQ(idx, 'section', e.target.value)}
+                        placeholder="Section"
+                      />
+                    </div>
+
+                    {/* Question Text */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <b style={{ color: '#0f172a', minWidth: '24px' }}>{q.number || idx + 1}.</b>
+                      <textarea
+                        rows={2}
+                        style={{ width: '100%', fontSize: '13px', padding: '6px 10px', borderRadius: '6px', border: '1px solid #cbd5e1' }}
+                        value={q.question_text}
+                        onChange={(e) => updateExtractedQ(idx, 'question_text', e.target.value)}
+                      />
+                    </div>
+
+                    {/* Marks / Weightage Input */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <label style={{ fontSize: '12px', color: '#64748b', fontWeight: 600 }}>Marks:</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="100"
+                        style={{ width: '60px', padding: '6px 8px', fontSize: '13px', fontWeight: 700, color: '#1e3a8a', textAlign: 'center' }}
+                        value={q.marks || 2}
+                        onChange={(e) => updateExtractedQ(idx, 'marks', Math.max(1, parseInt(e.target.value) || 1))}
+                      />
+                      <span style={{ fontSize: '12px', color: '#64748b' }}>M</span>
+                    </div>
+
+                    {/* Remove Action */}
+                    <button
+                      className="secondary"
+                      style={{ padding: '6px', border: 'none', color: '#ef4444' }}
+                      title="Delete Question"
+                      onClick={() => removeExtractedQ(idx)}
+                    >
+                      <Trash2 size={16} />
+                    </button>
                   </div>
                 ))}
               </div>
+
+              <div style={{ marginTop: '18px', display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+                <button
+                  className="primary"
+                  disabled={generatingPaper || extractedQs.length === 0}
+                  onClick={handleGeneratePaperKey}
+                  style={{ padding: '12px 24px', fontSize: '15px' }}
+                >
+                  <Sparkles size={18} /> {generatingPaper ? 'Generating Weightage-Based Answers…' : 'Generate Complete Answer Key'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Generated Question Paper Answer Key Display */}
+          {paperResult && paperResult.results && (
+            <div>
+              {/* Paper Header Action Bar */}
+              <div
+                style={{
+                  background: 'linear-gradient(135deg, #1e1b4b, #312e81)',
+                  color: '#fff',
+                  borderRadius: '12px',
+                  padding: '24px',
+                  marginBottom: '20px',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '16px',
+                }}
+              >
+                <div>
+                  <span style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px', opacity: 0.8, color: '#a5b4fc', fontWeight: 700 }}>
+                    Official Academic Answer Key & Marking Scheme
+                  </span>
+                  <h2 style={{ margin: '4px 0 8px 0', fontSize: '22px', fontWeight: 800 }}>
+                    {paperResult.paper_title || 'Question Paper Answer Key'}
+                  </h2>
+                  <div style={{ display: 'flex', gap: '16px', fontSize: '14px', opacity: 0.9 }}>
+                    <span><b>Subject:</b> {paperResult.subject_name || 'General Coursework'}</span>
+                    <span><b>Total Questions:</b> {paperResult.total_questions || paperResult.results.length}</span>
+                    <span><b>Total Marks:</b> {paperResult.total_marks} Marks</span>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                  <button
+                    className="secondary"
+                    style={{ background: '#fff', color: '#1e1b4b', fontWeight: 700, border: 'none' }}
+                    onClick={handlePrint}
+                  >
+                    <Printer size={16} /> Print / PDF
+                  </button>
+                  <button
+                    className="secondary"
+                    style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', border: '1px solid rgba(255,255,255,0.3)' }}
+                    onClick={handleDownloadTxt}
+                  >
+                    <Download size={16} /> Download TXT
+                  </button>
+                  <button
+                    className="secondary"
+                    style={{ background: '#059669', color: '#fff', border: 'none', fontWeight: 700 }}
+                    onClick={handleBatchFinalize}
+                  >
+                    <CheckCircle2 size={16} /> Finalize All
+                  </button>
+                  <button
+                    className="secondary"
+                    style={{ background: 'rgba(255,255,255,0.15)', color: '#fff', border: '1px solid rgba(255,255,255,0.3)' }}
+                    onClick={() => {
+                      setPaperResult(null);
+                      setExtractedQs([]);
+                      setSelectedFile(null);
+                      setPastedText('');
+                    }}
+                  >
+                    New Paper
+                  </button>
+                </div>
+              </div>
+
+              {/* Questions Answer Cards */}
+              <div style={{ display: 'grid', gap: '20px' }}>
+                {paperResult.results.map((q, idx) => {
+                  const isEditing = editingQIdx === idx;
+                  const points = safeArray(q.key_points);
+
+                  return (
+                    <div
+                      key={idx}
+                      className="panel"
+                      style={{
+                        padding: '22px',
+                        border: '1px solid #cbd5e1',
+                        borderRadius: '12px',
+                        background: '#ffffff',
+                        boxShadow: '0 2px 6px rgba(0,0,0,0.03)',
+                      }}
+                    >
+                      {/* Question Top Row */}
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'flex-start',
+                          borderBottom: '1px solid #f1f5f9',
+                          paddingBottom: '12px',
+                          marginBottom: '16px',
+                          gap: '12px',
+                        }}
+                      >
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                            <span style={{ fontSize: '12px', fontWeight: 700, color: '#6366f1', textTransform: 'uppercase' }}>
+                              {q.section || 'General'}
+                            </span>
+                            <span
+                              style={{
+                                background: '#e0e7ff',
+                                color: '#3730a3',
+                                padding: '2px 8px',
+                                borderRadius: '6px',
+                                fontSize: '12px',
+                                fontWeight: 800,
+                              }}
+                            >
+                              {q.marks} Marks Weightage
+                            </span>
+                          </div>
+                          <h4 style={{ margin: 0, fontSize: '16px', color: '#0f172a', lineHeight: 1.5 }}>
+                            <b>Q{q.number || idx + 1}.</b> {q.question_text}
+                          </h4>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          {!isEditing ? (
+                            <>
+                              <button
+                                className="secondary"
+                                style={{ padding: '6px 12px', fontSize: '12px' }}
+                                onClick={() => startEditingQ(idx)}
+                              >
+                                <Edit3 size={14} /> Edit
+                              </button>
+                              <button
+                                className="secondary"
+                                style={{ padding: '6px 12px', fontSize: '12px' }}
+                                disabled={regenBusyIdx === idx}
+                                onClick={() => handleRegenerateItem(idx)}
+                              >
+                                <RefreshCw size={14} className={regenBusyIdx === idx ? 'spin' : ''} />
+                                {regenBusyIdx === idx ? 'Regenerating…' : 'Regenerate'}
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button className="primary" style={{ padding: '6px 12px', fontSize: '12px' }} onClick={saveEditedQ}>
+                                <Save size={14} /> Save
+                              </button>
+                              <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px' }} onClick={() => setEditingQIdx(null)}>
+                                Cancel
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Model Answer Body */}
+                      {isEditing ? (
+                        <div style={{ display: 'grid', gap: '12px' }}>
+                          <Field label="Model Answer:">
+                            <textarea
+                              rows={8}
+                              style={{ width: '100%', fontSize: '13px', lineHeight: 1.6 }}
+                              value={editAnswerText}
+                              onChange={(e) => setEditAnswerText(e.target.value)}
+                            />
+                          </Field>
+                          <Field label="Weightage Key Points (One per line):">
+                            <textarea
+                              rows={4}
+                              style={{ width: '100%', fontSize: '13px', lineHeight: 1.6 }}
+                              value={editPointsText}
+                              onChange={(e) => setEditPointsText(e.target.value)}
+                            />
+                          </Field>
+                        </div>
+                      ) : (
+                        <div>
+                          <div style={{ marginBottom: '16px' }}>
+                            <span style={{ fontSize: '12px', fontWeight: 700, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                              Academic Model Answer ({q.marks} Marks Scale):
+                            </span>
+                            <div className="answer-body" style={{ marginTop: '8px' }}>
+                              {formatAnswerText(q.answer)}
+                            </div>
+                          </div>
+
+                          {/* Key Points & Marking Rubric */}
+                          {points.length > 0 && (
+                            <div
+                              style={{
+                                marginTop: '16px',
+                                background: '#f8fafc',
+                                border: '1px solid #e2e8f0',
+                                borderRadius: '10px',
+                                padding: '16px',
+                              }}
+                            >
+                              <h5
+                                style={{
+                                  margin: '0 0 12px 0',
+                                  fontSize: '14px',
+                                  fontWeight: 800,
+                                  color: '#059669',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '8px',
+                                }}
+                              >
+                                <CheckCircle2 size={16} color="#059669" /> Important Scoring Points & Weightage Rubric ({q.marks} Marks):
+                              </h5>
+                              <div style={{ display: 'grid', gap: '8px' }}>
+                                {points.map((pt, pIdx) => {
+                                  const textVal = String(pt).replaceAll('**', '').replaceAll('*', '');
+                                  return (
+                                    <div
+                                      key={pIdx}
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'flex-start',
+                                        gap: '10px',
+                                        background: '#fff',
+                                        padding: '10px 14px',
+                                        borderRadius: '8px',
+                                        border: '1px solid #e2e8f0',
+                                      }}
+                                    >
+                                      <span style={{ color: '#059669', fontWeight: 800, marginTop: '1px' }}>✓</span>
+                                      <span style={{ fontSize: '13px', color: '#334155', lineHeight: 1.5 }}>
+                                        {textVal}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: SINGLE QUESTION GENERATOR */}
+      {tab === 'single' && (
+        <div>
+          <div className="panel" style={{ padding: '22px', marginBottom: '20px' }}>
+            <h3 style={{ margin: '0 0 16px 0', fontSize: '17px', color: '#0f172a' }}>
+              Quick Single Question Answer Generator
+            </h3>
+
+            <div style={{ display: 'flex', gap: '16px', marginBottom: '14px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '14px' }}>
+                <input
+                  type="radio"
+                  name="single_source"
+                  checked={singleSource === 'bank'}
+                  onChange={() => setSingleSource('bank')}
+                />
+                Pick from Question Bank
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '14px' }}>
+                <input
+                  type="radio"
+                  name="single_source"
+                  checked={singleSource === 'custom'}
+                  onChange={() => setSingleSource('custom')}
+                />
+                Type / Paste Custom Question
+              </label>
+            </div>
+
+            <div className="form-grid">
+              <Field label="Subject">
+                <select value={sid} onChange={(e) => setSid(e.target.value)}>
+                  <option value="">Select Subject</option>
+                  {safeArray(subjects).map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.code} - {s.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+
+              {singleSource === 'bank' ? (
+                <Field label="Question">
+                  <select value={selectedQId} onChange={(e) => setSelectedQId(e.target.value)}>
+                    <option value="">Select Question</option>
+                    {safeArray(qs).map((q) => (
+                      <option key={q.id} value={q.id}>
+                        {String(q.question_text || '').slice(0, 100)} ({q.marks || 2}M)
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
+                <Field label="Custom Question Text">
+                  <input
+                    placeholder="e.g. Explain Round Robin Scheduling with an illustrative Gantt Chart."
+                    value={customQuestion}
+                    onChange={(e) => setCustomQuestion(e.target.value)}
+                  />
+                </Field>
+              )}
+
+              <Field label="Marks / Weightage">
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    style={{ width: '80px' }}
+                    value={singleMarks}
+                    onChange={(e) => setSingleMarks(e.target.value)}
+                  />
+                  {/* Presets */}
+                  {[2, 5, 8, 10, 16].map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      className="secondary"
+                      style={{
+                        padding: '6px 10px',
+                        fontSize: '12px',
+                        background: Number(singleMarks) === p ? '#e0e7ff' : '#f1f5f9',
+                        color: Number(singleMarks) === p ? '#3730a3' : '#475569',
+                        fontWeight: Number(singleMarks) === p ? 700 : 500,
+                      }}
+                      onClick={() => setSingleMarks(p)}
+                    >
+                      {p}M
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            </div>
+
+            <div style={{ marginTop: '16px' }}>
+              <button
+                className="primary"
+                disabled={singleBusy || (singleSource === 'bank' && !selectedQId) || (singleSource === 'custom' && !customQuestion.trim())}
+                onClick={handleGenSingle}
+              >
+                <KeyRound size={16} /> {singleBusy ? 'Generating Answer & Key Points…' : 'Generate Answer'}
+              </button>
+            </div>
+          </div>
+
+          {singleResult && (
+            <div className="panel" style={{ padding: '22px', border: '1px solid #cbd5e1', borderRadius: '12px' }}>
+              <div style={{ borderBottom: '1px solid #e2e8f0', paddingBottom: '14px', marginBottom: '16px' }}>
+                <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', padding: '3px 10px', borderRadius: '6px', fontSize: '12px', fontWeight: 700 }}>
+                  Academic Answer Key ({singleResult.marks || singleMarks} Marks Scale)
+                </span>
+                <h3 style={{ margin: '8px 0 0 0', fontSize: '18px', color: '#0f172a' }}>
+                  {singleResult.question_text || 'Generated Question Answer'}
+                </h3>
+              </div>
+
+              <div className="answer-body">{formatAnswerText(singleResult.answer)}</div>
+
+              {safeArray(singleResult.key_points).length > 0 && (
+                <div
+                  style={{
+                    marginTop: '24px',
+                    background: '#f8fafc',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: '12px',
+                    padding: '18px',
+                  }}
+                >
+                  <h4
+                    style={{
+                      margin: '0 0 14px 0',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      color: '#059669',
+                      fontSize: '15px',
+                      fontWeight: 700,
+                    }}
+                  >
+                    <CheckCircle2 size={18} color="#059669" /> Important Scoring Points & Weightage Rubric ({singleResult.marks || singleMarks} Marks):
+                  </h4>
+                  <div style={{ display: 'grid', gap: '8px' }}>
+                    {safeArray(singleResult.key_points).map((point, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'flex-start',
+                          gap: '10px',
+                          background: '#fff',
+                          padding: '10px 14px',
+                          borderRadius: '8px',
+                          border: '1px solid #e2e8f0',
+                        }}
+                      >
+                        <span style={{ color: '#059669', fontWeight: 800, marginTop: '1px' }}>✓</span>
+                        <span style={{ fontSize: '13px', color: '#334155', lineHeight: 1.5 }}>
+                          {String(point).replaceAll('**', '').replaceAll('*', '')}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 3: SAVED ANSWER KEYS */}
+      {tab === 'saved' && (
+        <div className="panel" style={{ padding: '20px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '12px' }}>
+            <h3 style={{ margin: 0, fontSize: '17px', color: '#0f172a' }}>Saved Answer Keys in Database</h3>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <input
+                placeholder="Search question..."
+                style={{ fontSize: '13px', padding: '6px 12px' }}
+                value={savedSearch}
+                onChange={(e) => setSavedSearch(e.target.value)}
+              />
+              <button className="secondary" onClick={loadSavedKeys}>
+                <RefreshCw size={14} className={loadingSaved ? 'spin' : ''} /> Refresh
+              </button>
+            </div>
+          </div>
+
+          {loadingSaved ? (
+            <p>Loading saved answer keys…</p>
+          ) : savedKeys.length === 0 ? (
+            <p style={{ color: '#64748b' }}>No saved answer keys found in the database. Generate some from the Upload Question Paper tab!</p>
+          ) : (
+            <div style={{ display: 'grid', gap: '10px' }}>
+              {savedKeys
+                .filter((k) => !savedSearch || String(k.question_text || '').toLowerCase().includes(savedSearch.toLowerCase()))
+                .map((k) => (
+                  <div
+                    key={k.id}
+                    style={{
+                      background: '#fff',
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '8px',
+                      padding: '12px 16px',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '12px',
+                    }}
+                  >
+                    <div>
+                      <b style={{ color: '#0f172a', fontSize: '14px' }}>{k.question_text}</b>
+                      <div style={{ display: 'flex', gap: '12px', marginTop: '4px', fontSize: '12px', color: '#64748b' }}>
+                        <span><b>Weightage:</b> {k.marks || 1} Marks</span>
+                        <span><b>Status:</b> {k.status || 'draft'}</span>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button
+                        className="secondary"
+                        style={{ fontSize: '12px', padding: '4px 8px', color: '#ef4444' }}
+                        onClick={async () => {
+                          if (confirm('Delete this answer key?')) {
+                            await api(`/answer-keys/${k.id}`, { method: 'DELETE' }).catch(() => {});
+                            loadSavedKeys();
+                          }
+                        }}
+                      >
+                        <Trash2 size={14} /> Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
             </div>
           )}
         </div>

@@ -4,7 +4,7 @@ import io
 import random
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -100,6 +100,21 @@ class AnswerGenIn(BaseModel):
     question_id: int | None = None
     question_text: str
     marks: int = 1
+    subject_id: int | None = None
+
+
+class PaperQuestionItem(BaseModel):
+    number: int | str | None = None
+    section: str = "General"
+    question_text: str
+    marks: int = 2
+
+
+class PaperAnswerGenIn(BaseModel):
+    paper_title: str = "Question Paper Answer Key"
+    subject_id: int | None = None
+    paper_id: int | None = None
+    questions: list[PaperQuestionItem]
 
 
 # =========================================================
@@ -2168,13 +2183,21 @@ def generate_key(
     db: Session = Depends(get_db),
     user=Depends(current_user),
 ):
+    subject_name = None
+    if data.subject_id:
+        sub = db.get(Subject, data.subject_id)
+        if sub:
+            subject_name = sub.name
+
     try:
         answer, points = generate_answer(
             data.question_text,
-            data.marks
+            data.marks,
+            subject=subject_name
         )
     except Exception as e:
-        raise HTTPException(500, f"AI generation failed: {str(e)}")
+        from ..services.academic_kb import get_academic_answer
+        answer, points = get_academic_answer(data.question_text, data.marks)
 
     ak_id = None
     try:
@@ -2418,6 +2441,303 @@ async def upload_answer_key(
         "answer": answer_key.answer,
         "message": "Existing answer key uploaded",
     }
+
+
+def parse_question_paper_text(text: str) -> list[dict]:
+    lines = text.splitlines()
+    extracted = []
+
+    current_section = "General"
+    section_marks = 2
+
+    current_q_num = None
+    current_q_text = []
+    current_q_marks = None
+    current_q_sec = "General"
+
+    sec_pattern = re.compile(
+        r"^(?:(?:section|part|module|unit)\s*[-_:]?\s*([a-z0-9]+)|(\d+)\s*marks?\s*(?:questions?|each)?|questions?\s*carrying\s*(\d+)\s*marks?)",
+        re.I
+    )
+
+    sec_marks_calc = re.compile(
+        r"(\d+)\s*x\s*(\d+)\s*=\s*(\d+)\s*(?:[mM]arks?)?",
+        re.I
+    )
+
+    q_start_pattern = re.compile(
+        r"^(?:q(?:uestion)?\s*[\.:\-]?\s*)?(\d+|[a-z]|[ivxIVX]+)[\.\)\:\-]\s+(.*)",
+        re.I
+    )
+
+    marks_explicit_pattern = re.compile(
+        r"[\(\[]\s*(\d+)\s*(?:[mM]arks?|[mM])?\s*[\)\]]\s*$",
+        re.I
+    )
+
+    skip_headers = re.compile(
+        r"^(university|department|b\.?tech|m\.?tech|semester|time\s*:|max(?:imum)?\s*marks|register\s*no|roll\s*no|instructions?\s*:|answer\s*all|answer\s*any|note\s*:|course\s*code|subject\s*code|page\s*\d+)",
+        re.I
+    )
+
+    def flush_q():
+        nonlocal current_q_num, current_q_text, current_q_marks, current_q_sec
+        if current_q_text:
+            raw_text = " ".join(current_q_text).strip()
+            m_match = marks_explicit_pattern.search(raw_text)
+            if m_match:
+                final_marks = int(m_match.group(1))
+                clean_text = raw_text[:m_match.start()].strip()
+            else:
+                inline_m = re.search(r"[\(\[]\s*(\d+)\s*(?:[mM]arks?|[mM])\s*[\)\]]", raw_text, re.I)
+                if inline_m:
+                    final_marks = int(inline_m.group(1))
+                    clean_text = raw_text.replace(inline_m.group(0), "").strip()
+                else:
+                    final_marks = current_q_marks or section_marks
+                    clean_text = raw_text
+
+            clean_text = re.sub(r"^(?:q(?:uestion)?\s*[\.:\-]?\s*)?(?:\d+|[a-z]|[ivxIVX]+)[\.\)\:\-]\s*", "", clean_text, flags=re.I).strip()
+
+            if len(clean_text) >= 5:
+                extracted.append({
+                    "number": len(extracted) + 1,
+                    "original_label": current_q_num or str(len(extracted) + 1),
+                    "section": current_q_sec,
+                    "question_text": clean_text,
+                    "marks": final_marks
+                })
+        current_q_num = None
+        current_q_text = []
+        current_q_marks = None
+
+    for raw_line in lines:
+        line = raw_line.strip().lstrip('\ufeff')
+        if not line:
+            continue
+
+        if skip_headers.search(line):
+            continue
+
+        sec_m = sec_pattern.search(line)
+        if sec_m:
+            flush_q()
+            matched_sec = sec_m.group(1) or ""
+            calc_m = sec_marks_calc.search(line)
+            if calc_m:
+                section_marks = int(calc_m.group(2))
+                current_section = f"Section {matched_sec.upper() or 'A'}"
+            elif sec_m.group(2):
+                section_marks = int(sec_m.group(2))
+                current_section = f"{section_marks} Marks Section"
+            elif sec_m.group(3):
+                section_marks = int(sec_m.group(3))
+                current_section = f"{section_marks} Marks Section"
+            else:
+                current_section = f"Section {matched_sec.upper() or 'A'}"
+                if matched_sec.lower() in ['a', '1', 'one']:
+                    section_marks = 2
+                elif matched_sec.lower() in ['b', '2', 'two']:
+                    section_marks = 8
+                elif matched_sec.lower() in ['c', '3', 'three']:
+                    section_marks = 16
+            continue
+
+        q_m = q_start_pattern.search(line)
+        if q_m:
+            flush_q()
+            current_q_num = q_m.group(1)
+            current_q_sec = current_section
+            current_q_marks = section_marks
+            current_q_text.append(line)
+        else:
+            if current_q_text:
+                current_q_text.append(line)
+            else:
+                inline_m = marks_explicit_pattern.search(line)
+                if inline_m and len(line) > 15:
+                    current_q_num = str(len(extracted) + 1)
+                    current_q_sec = current_section
+                    current_q_marks = int(inline_m.group(1))
+                    current_q_text.append(line)
+                    flush_q()
+
+    flush_q()
+    return extracted
+
+
+@router.post("/answer-keys/upload-paper")
+async def upload_question_paper_for_answer_key(
+    file: UploadFile = File(None),
+    text_content: str = Form(None),
+    paper_title: str = Form(None),
+    subject_id: int = Form(None),
+    db: Session = Depends(get_db),
+    user=Depends(current_user),
+):
+    text = ""
+    filename = ""
+    if file and file.filename:
+        filename = file.filename
+        raw = await file.read()
+        lower_name = filename.lower()
+        if lower_name.endswith(".pdf"):
+            reader = PdfReader(io.BytesIO(raw))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        elif lower_name.endswith(".docx"):
+            doc = Document(io.BytesIO(raw))
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif lower_name.endswith(".txt"):
+            text = raw.decode("utf-8", errors="ignore")
+        elif lower_name.endswith(".csv"):
+            import csv
+            decoded = raw.decode("utf-8", errors="ignore")
+            rows = csv.reader(io.StringIO(decoded))
+            text = "\n".join(" ".join(c.strip() for c in r if c and c.strip()) for r in rows)
+        elif lower_name.endswith(".xlsx"):
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+                rows = []
+                for s in wb.worksheets:
+                    for r in s.iter_rows(values_only=True):
+                        v = [str(x).strip() for x in r if x is not None and str(x).strip()]
+                        if v:
+                            rows.append(" ".join(v))
+                text = "\n".join(rows)
+            except Exception as e:
+                raise HTTPException(400, f"Unable to read XLSX file: {e}")
+        else:
+            text = raw.decode("utf-8", errors="ignore")
+    elif text_content:
+        text = text_content
+        filename = "pasted_text.txt"
+    else:
+        raise HTTPException(400, "Please upload a question paper file (PDF, DOCX, TXT) or paste question paper text.")
+
+    if not text.strip():
+        raise HTTPException(400, "No readable text found in the question paper.")
+
+    questions = parse_question_paper_text(text)
+    if not questions:
+        raw_lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 10]
+        if raw_lines:
+            questions = [
+                {
+                    "number": idx + 1,
+                    "original_label": str(idx + 1),
+                    "section": "General",
+                    "question_text": l,
+                    "marks": 2
+                }
+                for idx, l in enumerate(raw_lines[:30])
+            ]
+        else:
+            raise HTTPException(400, "No questions could be detected in the uploaded paper.")
+
+    detected_title = paper_title
+    if not detected_title:
+        non_empty = [l.strip() for l in text.splitlines() if l.strip()][:3]
+        for line in non_empty:
+            if len(line) > 5 and not re.search(r"^(section|part|q(?:uestion)?|\d+[\.\)])", line, re.I):
+                detected_title = line
+                break
+        if not detected_title:
+            detected_title = Path(filename).stem if filename else "Uploaded Question Paper"
+
+    return {
+        "filename": filename,
+        "paper_title": detected_title,
+        "subject_id": subject_id,
+        "total_questions": len(questions),
+        "total_marks": sum(q.get("marks", 2) for q in questions),
+        "questions": questions,
+        "raw_text": text[:3000]
+    }
+
+
+@router.post("/answer-keys/generate-paper")
+def generate_paper_answer_key(
+    data: PaperAnswerGenIn,
+    db: Session = Depends(get_db),
+    user=Depends(current_user),
+):
+    if not data.questions:
+        raise HTTPException(400, "No questions provided to generate answer key.")
+
+    subject_name = None
+    if data.subject_id:
+        sub = db.get(Subject, data.subject_id)
+        if sub:
+            subject_name = sub.name
+
+    results = []
+    for item in data.questions:
+        q_text = item.question_text.strip()
+        marks = item.marks if item.marks > 0 else 2
+        try:
+            ans, pts = generate_answer(q_text, marks=marks, subject=subject_name)
+        except Exception:
+            from ..services.academic_kb import get_academic_answer
+            ans, pts = get_academic_answer(q_text, marks)
+
+        ak_id = None
+        try:
+            ak = AnswerKey(
+                paper_id=data.paper_id,
+                question_text=q_text,
+                answer=ans,
+                key_points=json.dumps(pts),
+                marks=marks,
+                answer_type="Weightage-Scaled Academic",
+                ai_generated=True,
+                faculty_edited=False,
+                validation_status="valid",
+                status="draft",
+                created_by=user.id if user else None,
+            )
+            db.add(ak)
+            db.commit()
+            db.refresh(ak)
+            ak_id = ak.id
+        except Exception:
+            db.rollback()
+
+        results.append({
+            "id": ak_id or random.randint(1000, 9999),
+            "number": item.number,
+            "section": item.section,
+            "question_text": q_text,
+            "marks": marks,
+            "answer": ans,
+            "key_points": pts,
+        })
+
+    return {
+        "paper_title": data.paper_title or "Question Paper Answer Key",
+        "subject_id": data.subject_id,
+        "subject_name": subject_name or "General",
+        "total_questions": len(results),
+        "total_marks": sum(r["marks"] for r in results),
+        "results": results,
+    }
+
+
+@router.post("/answer-keys/batch-finalize")
+def batch_finalize_answer_keys(
+    data: dict,
+    db: Session = Depends(get_db),
+    user=Depends(current_user),
+):
+    ids = data.get("ids", [])
+    if not ids:
+        raise HTTPException(400, "No answer key IDs provided.")
+    updated = db.query(AnswerKey).filter(AnswerKey.id.in_(ids)).update(
+        {"status": "final", "validation_status": "valid"},
+        synchronize_session=False
+    )
+    db.commit()
+    return {"message": f"{updated} answer keys finalized successfully.", "count": updated}
 
 
 # =========================================================

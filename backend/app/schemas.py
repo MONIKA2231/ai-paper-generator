@@ -29,7 +29,20 @@ class BlueprintIn(BaseModel):
 class PaperGenIn(BaseModel):
     subject_id:int; syllabus_id:int|None=None; blueprint_id:int|None=None; title:str="AI Generated Question Paper"; exam_type:str="Internal Assessment"; duration:str="90 Minutes"; total_marks:int=50; total_questions:int=10; choice_mode:str="No Choice"; generation_mode:str="hybrid"; topics:list[str]=[]; instructions:str=""; section_a_questions:int=5; section_a_marks:int=2; section_b_questions:int=5; section_b_marks:int=8
     subject_id:int; syllabus_id:int|None=None; blueprint_id:int|None=None; title:str="AI Generated Question Paper"; exam_type:str="Internal Assessment"; duration:str="90 Minutes"; total_marks:int=50; total_questions:int=10; choice_mode:str="No Choice"; topics:list[str]=[]; instructions:str=""; section_a_questions:int=5; section_a_marks:int=2; section_b_questions:int=5; section_b_marks:int=8
-class AnswerGenIn(BaseModel): paper_id:int|None=None; question_id:int|None=None; question_text:str; marks:int=1
+class AnswerGenIn(BaseModel): paper_id:int|None=None; question_id:int|None=None; question_text:str; marks:int=1; subject_id:int|None=None
+
+class PaperQuestionItem(BaseModel):
+    number: int | str | None = None
+    section: str = "General"
+    question_text: str
+    marks: int = 2
+
+class PaperAnswerGenIn(BaseModel):
+    paper_title: str = "Question Paper Answer Key"
+    subject_id: int | None = None
+    paper_id: int | None = None
+    questions: list[PaperQuestionItem]
+
 class ChatIn(BaseModel): message:str
 
 class AdminUserCreateIn(BaseModel):
